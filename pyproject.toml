@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "snakemake-ai-debugger"
+version = "0.1.0"
+description = "AI-powered root-cause analysis for failed Snakemake bioinformatics pipelines"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["snakemake", "bioinformatics", "debugging", "AI", "LLM", "HPC"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Programming Language :: Python :: 3",
+]
+dependencies = [
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+llm = ["anthropic>=0.25.0"]
+dev = ["pytest", "pytest-cov"]
+
+[project.scripts]
+snakemake-collect     = "snakemake_ai_debugger.collect:main"
+snakemake-ai-debugger = "snakemake_ai_debugger.diagnose:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["snakemake_ai_debugger*"]

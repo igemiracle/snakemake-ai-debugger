@@ -1,0 +1,16 @@
+README.md
+pyproject.toml
+snakemake_ai_debugger/__init__.py
+snakemake_ai_debugger/collect.py
+snakemake_ai_debugger/diagnose.py
+snakemake_ai_debugger/log_collector.py
+snakemake_ai_debugger/rules.py
+snakemake_ai_debugger/snakemake_hook.py
+snakemake_ai_debugger.egg-info/PKG-INFO
+snakemake_ai_debugger.egg-info/SOURCES.txt
+snakemake_ai_debugger.egg-info/dependency_links.txt
+snakemake_ai_debugger.egg-info/entry_points.txt
+snakemake_ai_debugger.egg-info/requires.txt
+snakemake_ai_debugger.egg-info/top_level.txt
+tests/test_collect.py
+tests/test_diagnose.py

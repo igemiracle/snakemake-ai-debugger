@@ -1,0 +1,6 @@
+.pytest_cache/
+*.pyc
+.env
+.venv/
+.DS_Store
+.snakemake/

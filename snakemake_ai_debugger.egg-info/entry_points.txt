@@ -1,0 +1,3 @@
+[console_scripts]
+snakemake-ai-debugger = snakemake_ai_debugger.diagnose:main
+snakemake-collect = snakemake_ai_debugger.collect:main
