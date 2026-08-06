@@ -1,11 +1,15 @@
 """
-collect.py -- Pure error collection and display (no LLM)
+collect.py -- Error collection and display
 =========================================
 Responsibilities:
   1. Parse failed rule names from the Snakemake main log
   2. Find the real error content in slurm_logs (see priority chain in log_collector.py)
-  3. Run Tier-1 rule-based classifier
+  3. Run Tier-1 rule-based classifier (identification only — fast, free, no fixes)
   4. Coloured terminal output + write YAML report
+  5. Optional: --llm flag makes ONE combined call to the configured LLM
+     across all *distinct* error groups and prints its free-form summary of
+     what's actually wrong — no rigid per-field template, no hand-maintained
+     fix string for every possible tool error in rules.py.
 
 Trigger modes:
   A. Snakefile onerror hook (recommended) -- add two lines at the top:
@@ -14,13 +18,13 @@ Trigger modes:
 
   B. Manual CLI:
        snakemake-collect --slurm-log-dir .snakemake/slurm_logs
-
-  C. Can also be called from diagnose.py --no-llm mode (future)
+       snakemake-collect --llm                    # add LLM-generated fixes
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import textwrap
 from dataclasses import dataclass, field
@@ -32,6 +36,7 @@ import yaml
 
 from .log_collector import resolve_rule_log, describe_slurm_log_dir, SlurmLogResult
 from .rules import quick_diagnose, QuickDiagnosis
+from . import llm_backends
 
 # ── ANSI colours ──────────────────────────────────────────────────
 RESET = "\033[0m"; BOLD = "\033[1m"; DIM = "\033[2m"
@@ -245,12 +250,13 @@ class CollectedError:
         if self.diagnosis:
             d["error_type"]      = self.diagnosis.error_type
             d["root_cause"]      = self.diagnosis.root_cause
-            d["fix_suggestions"] = self.diagnosis.fix_suggestions
             d["confidence"]      = self.diagnosis.confidence
             d["matched_pattern"] = self.diagnosis.matched_pattern
+            if self.diagnosis.matched_text:
+                d["matched_text"] = self.diagnosis.matched_text
         else:
             d["error_type"] = "Unrecognised"
-            d["root_cause"] = "(no matching pattern — run snakemake-ai-debugger to escalate)"
+            d["root_cause"] = "(no matching pattern — run with --llm to escalate)"
             ctx = self.slurm_result.error_context
             if ctx:
                 d["error_context"] = ctx
@@ -269,7 +275,8 @@ def collect(
 ) -> list[CollectedError]:
     """
     Parse failed rules from main log -> harvest slurm log -> Tier-1 classification.
-    Returns a list of CollectedError. No LLM calls.
+    Returns a list of CollectedError. No LLM calls -- call get_llm_summary()
+    separately on the result if you want the optional LLM escalation.
     """
     # 1. Find the latest Snakemake main log
     main_log = _find_latest_log(log_dir)
@@ -315,9 +322,13 @@ def collect(
             print(_c(f"  ⚠  {meta.rule_name}  no log found "
                      f"(tried slurm_logs + declared paths)", YELLOW))
 
-        # 3. Tier-1 rule-based classifier
+        # 3. Tier-1 rule-based classifier — match against the windowed
+        # error_context (lines around error-signal tokens), not the raw
+        # tail: Snakemake often appends retry/shutdown boilerplate after a
+        # job's real stderr, which can push the actual error out of a plain
+        # tail even when --tail is generous.
         diag = quick_diagnose(
-            rule_log        = sl.content,
+            rule_log        = sl.error_context,
             snakemake_block = meta.block_text,
         )
 
@@ -347,62 +358,212 @@ def collect(
 # Step 4: Render and save
 # ─────────────────────────────────────────────────────────────────
 
-def render(errors: list[CollectedError]) -> None:
-    """Full coloured terminal report."""
+# Job-preamble lines that vary between jobs but carry no diagnostic signal
+# (dict key ordering, resource values, the benign "no nv files" GPU warning
+# that Singularity prints on every job regardless of success). Left in, these
+# push the real error content past the signature window and make identical
+# failures fingerprint differently per sample.
+_NOISE_LINE_RE = re.compile(
+    r"^\s*(threads:|resources:|Shell command:|Activating singularity image"
+    r"|WARNING: Could not find any nv files)",
+    re.IGNORECASE,
+)
+
+
+def _normalize_signature_text(text: str, wildcards: str) -> str:
+    """Strip sample-specific tokens so identical failures fingerprint the
+    same regardless of which sample/path they came from."""
+    norm = text
+    # Sample/wildcard values (e.g. "SKNAS_MYCN_4h") often appear as bare
+    # tokens, not inside a path, so substitute them explicitly before the
+    # generic path/digit normalization below.
+    for val in re.findall(r"=\s*([^,]+)", wildcards):
+        val = val.strip()
+        if val:
+            norm = norm.replace(val, "<wc>")
+    norm = re.sub(r"/\S+", "<path>", norm)
+    norm = re.sub(r"\d+", "#", norm)
+    return norm
+
+
+def _error_signature(err: CollectedError) -> str:
+    """Fingerprint used to cluster duplicate failures (e.g. the same rule
+    failing identically across many samples) so the report shows one root
+    cause instead of N near-identical blocks.
+
+    Rule-based hits are keyed on the *actual matched log line*, not just the
+    pattern name — a broad pattern (e.g. a generic "SQANTI3 error") can match
+    genuinely different underlying failures, and those must stay separate
+    rather than being reported as one repeated error.
+    """
+    if err.diagnosis:
+        norm = _normalize_signature_text(err.diagnosis.matched_text, err.wildcards)
+        return f"{err.rule_name}::rule-based::{err.diagnosis.matched_pattern}::{norm}"
+    ctx = err.slurm_result.error_context or ""
+    kept = [ln for ln in ctx.splitlines() if not _NOISE_LINE_RE.match(ln)]
+    norm = _normalize_signature_text("\n".join(kept), err.wildcards)
+    return f"{err.rule_name}::unrecognised::{norm}"
+
+
+def _group_errors(errors: list[CollectedError]) -> list[list[CollectedError]]:
+    groups: dict[str, list[CollectedError]] = {}
+    order: list[str] = []
+    for err in errors:
+        sig = _error_signature(err)
+        if sig not in groups:
+            groups[sig] = []
+            order.append(sig)
+        groups[sig].append(err)
+    return [groups[sig] for sig in order]
+
+
+_LLM_SYSTEM_PROMPT = (
+    "You are a bioinformatics/HPC engineer helping debug a failed Snakemake "
+    "cluster run. Below are one or more DISTINCT failed jobs (already "
+    "deduplicated -- each one is a genuinely different failure, not a repeat "
+    "of another). For each one, in plain prose (no markdown, no JSON, no "
+    "rigid template):\n"
+    "  - say what actually went wrong, concretely\n"
+    "  - give the single most likely fix\n"
+    "  - ALWAYS repeat the exact log file path given for that error, so the "
+    "reader can open that exact file -- this is the most important part, "
+    "never omit it or paraphrase the path\n"
+    "If a fast classifier's guess is given for an error, don't just restate "
+    "it -- add the detail that makes the fix actionable. Be concise and "
+    "concrete; skip generic advice."
+)
+
+
+def _build_run_prompt(groups: list[list[CollectedError]]) -> str:
+    parts = []
+    for i, group in enumerate(groups, 1):
+        rep = group[0]
+        n = len(group)
+        header = f"[Error {i}] Rule: {rep.rule_name}"
+        if n > 1:
+            header += f" ({n} samples affected)"
+        parts.append(header)
+        if rep.wildcards:
+            parts.append(f"Wildcards: {rep.wildcards}")
+        log_path = rep.slurm_result.display_path() if rep.slurm_result.log_path else "(no log file found)"
+        parts.append(f"Log file path: {log_path}")
+        if rep.diagnosis:
+            parts.append(
+                f"A fast classifier already labelled this: {rep.diagnosis.error_type} "
+                f"— {rep.diagnosis.root_cause}"
+            )
+        ctx = rep.slurm_result.error_context or "(no log content captured)"
+        parts.append(f"Log excerpt:\n{ctx}")
+    return "\n\n".join(parts)
+
+
+def get_llm_summary(
+    errors: list[CollectedError],
+    backend: Optional[str] = None,
+    model: Optional[str] = None,
+) -> Optional[str]:
+    """One combined LLM call across all distinct error groups (not once per
+    sample, not once per hardcoded rules.py pattern) -- returns its free-form
+    summary, or None if there's nothing to summarize or the call fails."""
+    groups = _group_errors(errors)
+    if not groups:
+        return None
+    try:
+        resolved_backend, resolved_model, api_key = llm_backends.resolve(backend, model)
+    except RuntimeError as e:
+        print(_c(f"\n  ✗ --llm: {e}", RED), file=sys.stderr)
+        return None
+
+    print(_c(f"\n  ⚡ Calling {resolved_backend}/{resolved_model} for a summary "
+             f"of {len(groups)} distinct error(s)…", CYAN))
+    try:
+        return llm_backends.call_llm(
+            _build_run_prompt(groups), _LLM_SYSTEM_PROMPT,
+            resolved_backend, resolved_model, api_key, max_tokens=200 * len(groups),
+        )
+    except Exception as e:
+        print(_c(f"  ⚠ LLM error: {e}", YELLOW))
+        return None
+
+
+def render(errors: list[CollectedError], llm_summary: Optional[str] = None) -> None:
+    """Full coloured terminal report, clustered by error signature. Pass the
+    string from get_llm_summary() to print it as a prominent block up top."""
     n_ok  = sum(1 for e in errors if e.recognised)
     n_unk = len(errors) - n_ok
+    groups = _group_errors(errors)
 
     print()
     print(_c("━" * 66, BOLD))
     print(_c("  🔬  snakemake-ai-debugger  —  Error Collector", BOLD, CYAN))
     print(_c("━" * 66, BOLD))
-    print(f"  {len(errors)} failed job(s)  ·  "
+    print(f"  {len(errors)} failed job(s) in {len(groups)} distinct error(s)  ·  "
           f"{_c(str(n_ok)+' recognised', GREEN)}  ·  "
           f"{_c(str(n_unk)+' unrecognised', YELLOW if n_unk else DIM)}")
 
-    for i, err in enumerate(errors, 1):
-        _render_one(err, i, len(errors))
+    if llm_summary:
+        print()
+        print(_c("─" * 66, BOLD))
+        print(_c("  LLM Summary", BOLD, CYAN))
+        print(_c("─" * 66, BOLD))
+        for para in llm_summary.strip().splitlines():
+            if para.strip():
+                print(textwrap.fill(para, width=74, initial_indent="  ", subsequent_indent="  "))
+            else:
+                print()
+
+    for i, group in enumerate(groups, 1):
+        _render_group(group, i, len(groups))
 
     print()
     print(_c("━" * 66, DIM))
-    if any(not e.recognised for e in errors):
-        print(_c("  Tip: run `python -m snakemake_ai_debugger.diagnose` to escalate unrecognised errors to Claude", DIM))
+    if not llm_summary and any(not e.recognised for e in errors):
+        print(_c("  Tip: re-run with --llm for a plain-language summary of "
+                 "unrecognised errors (needs a configured backend — see "
+                 "llm_backends.py)", DIM))
     print()
 
 
-def _render_one(err: CollectedError, idx: int, total: int) -> None:
-    title = f"  [{idx}/{total}]  {err.rule_name}"
-    if err.wildcards:
-        title += f"  {_c('(' + err.wildcards + ')', DIM)}"
+def _render_group(group: list[CollectedError], idx: int, total: int) -> None:
+    rep = group[0]
+    n = len(group)
+
+    title = f"  [{idx}/{total}]  {rep.rule_name}"
+    if n > 1:
+        title += f"  {_c(f'× {n} samples', BOLD, MAGENTA)}"
+    elif rep.wildcards:
+        title += f"  {_c('(' + rep.wildcards + ')', DIM)}"
 
     print()
     print(_c("─" * 66, BOLD))
-    print(_c(title, BOLD, RED if not err.recognised else BOLD))
-    if err.slurm_result.log_path:
-        print(f"  {_c('Log:', DIM)} {_c(err.slurm_result.display_path(), DIM)}")
+    print(_c(title, BOLD, RED if not rep.recognised else BOLD))
+    if rep.slurm_result.log_path:
+        print(f"  {_c('Log (representative):', DIM)} {_c(rep.slurm_result.display_path(), DIM)}")
+    if n > 1:
+        samples = [e.wildcards or e.jobid for e in group]
+        shown = ", ".join(s for s in samples[:8] if s)
+        more = f"  … +{n - 8} more" if n > 8 else ""
+        print(f"  {_c('Affected:', DIM)} {shown}{more}")
     print(_c("─" * 66, BOLD))
 
-    if err.diagnosis:
-        d = err.diagnosis
+    if rep.diagnosis:
+        d = rep.diagnosis
         conf_color = GREEN if d.confidence >= 0.7 else YELLOW
         print(f"  {_c('Error type', BOLD)}   {_c(d.error_type, YELLOW)}")
         print(f"  {_c('Confidence', BOLD)}   {_c(f'{d.confidence*100:.0f}%', conf_color)}")
+        if d.matched_text:
+            print(f"  {_c('Evidence', BOLD)}     {_c(d.matched_text, DIM)}")
         print()
         print(f"  {_c('Root Cause', BOLD)}")
         print(textwrap.fill(d.root_cause, width=74,
                             initial_indent="    ", subsequent_indent="    "))
-        print()
-        print(f"  {_c('Fix Suggestions', BOLD)}")
-        for i, fix in enumerate(d.fix_suggestions, 1):
-            line = textwrap.fill(fix, width=70, subsequent_indent="       ")
-            print(f"    {_c(str(i)+'.', GREEN, BOLD)} {line}")
         print()
         print(f"  {_c('Matched:', DIM)} {_c(d.matched_pattern, DIM)}")
 
     else:
         print(f"  {_c('Error type', BOLD)}   {_c('Unrecognised', YELLOW)}")
         print()
-        ctx = err.slurm_result.error_context
+        ctx = rep.slurm_result.error_context
         if ctx:
             _MAX_CTX_LINES = 15
             ctx_lines = ctx.splitlines()
@@ -455,10 +616,20 @@ def on_error_hook(
         snakemake_log = snakemake_log[0] if snakemake_log else None
     log_dir      = Path(snakemake_log).parent if snakemake_log else Path(".snakemake/log")
     slurm_dir    = Path(slurm_log_dir)
-    errors       = collect(log_dir=log_dir, slurm_log_dir=slurm_dir)
+    errors = collect(log_dir=log_dir, slurm_log_dir=slurm_dir)
 
     if errors:
-        render(errors)
+        # Normal mode stays LLM-free by default even in the hook; opt in
+        # explicitly (same pattern as SNAKEMAKE_AI_QUIET) since the hook has
+        # no CLI flags.
+        llm_summary = None
+        if os.environ.get("SNAKEMAKE_AI_LLM") == "1":
+            llm_summary = get_llm_summary(
+                errors,
+                backend=os.environ.get("SNAKEMAKE_AI_BACKEND") or None,
+                model=os.environ.get("SNAKEMAKE_AI_MODEL") or None,
+            )
+        render(errors, llm_summary=llm_summary)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         save_report(errors, Path(report_dir) / f"{ts}.yaml")
 
@@ -483,8 +654,25 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Override: path to a specific log file (single-rule debugging)")
     p.add_argument("--output",        type=Path, default=None,
                    help="Write YAML report here  (default: auto-timestamped)")
-    p.add_argument("--tail",          type=int,  default=80,
-                   help="Lines of slurm log to read  (default: 80)")
+    p.add_argument("--tail",          type=int,  default=2000,
+                   help="Lines of slurm log to read  (default: 2000; matches "
+                        "the collect() API default — a small tail can cut off "
+                        "the real error when Snakemake appends retry/shutdown "
+                        "boilerplate after a job's own stderr)")
+    p.add_argument("--llm",           action="store_true",
+                   help="Escalate each distinct error to an LLM for a concise, "
+                        "dynamically-generated fix (off by default — normal mode "
+                        "is Tier-1 only, no network calls). Requires a backend "
+                        "configured via --backend/--model or "
+                        ".snakemake_ai_debugger.yaml — see llm_backends.py.")
+    p.add_argument("--backend",       type=str,  default=None,
+                   choices=list(llm_backends.KNOWN_BACKENDS),
+                   help="LLM backend for --llm (claude | openai | gemini). "
+                        "No default — must be set here or in the config file.")
+    p.add_argument("--model",         type=str,  default=None,
+                   help="Model id for --llm (e.g. claude-opus-5, gpt-5, "
+                        "gemini-2.5-pro). No default — must be set here or in "
+                        "the config file.")
     return p
 
 
@@ -499,7 +687,11 @@ def main(argv: Optional[list[str]] = None) -> None:
     if not errors:
         return
 
-    render(errors)
+    llm_summary = None
+    if args.llm:
+        llm_summary = get_llm_summary(errors, backend=args.backend, model=args.model)
+
+    render(errors, llm_summary=llm_summary)
     out = args.output or Path(f"ai_debug_{datetime.now().strftime('%Y%m%d_%H%M%S')}.yaml")
     save_report(errors, out)
 

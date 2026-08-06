@@ -225,7 +225,12 @@ def _snakefile_rule_snippet(snakefile: Optional[Path], rule_name: str, context: 
 # Step 3: LLM call
 # ─────────────────────────────────────────────────────────────────
 
-def call_claude(prompt: str, model: str = "claude-sonnet-4-6") -> str:
+def call_claude(
+    prompt: str,
+    model: str = "claude-sonnet-4-6",
+    system: str = SYSTEM_PROMPT,
+    max_tokens: int = 800,
+) -> str:
     try:
         import anthropic
     except ImportError:
@@ -236,8 +241,8 @@ def call_claude(prompt: str, model: str = "claude-sonnet-4-6") -> str:
     client = anthropic.Anthropic(api_key=api_key)
     msg = client.messages.create(
         model=model,
-        max_tokens=800,
-        system=SYSTEM_PROMPT,
+        max_tokens=max_tokens,
+        system=system,
         messages=[{"role": "user", "content": prompt}],
     )
     return msg.content[0].text
@@ -267,6 +272,7 @@ class RuleDiagnosis:
     follow_up_checks: list[str] = field(default_factory=list)
     confidence:       float = 0.0
     matched_pattern:  str = ""
+    matched_text:     str = ""      # actual log line that fired a Tier-1 pattern
     wildcards:        str = ""      # from slurm log path
     slurm_log_path:   str = ""      # for reference in YAML
     raw_llm:          str = ""
@@ -290,67 +296,112 @@ class RuleDiagnosis:
             d["follow_up_checks"] = self.follow_up_checks
         if self.matched_pattern:
             d["matched_pattern"] = self.matched_pattern
+        if self.matched_text:
+            d["matched_text"] = self.matched_text
         return d
 
 
-def render_single(d: RuleDiagnosis, idx: int, total: int) -> None:
-    header = f"  Rule {idx}/{total}: {d.rule_name}"
-    if d.wildcards:
-        header += f"  {_c('['+d.wildcards+']', DIM)}"
-    tier_label = _c(f"[{d.tier}]", GREEN if d.tier == "rule-based" else CYAN)
-    conf = d.confidence
+def _diagnosis_signature(d: RuleDiagnosis) -> str:
+    """Fingerprint used to cluster duplicate failures (e.g. the same rule
+    failing identically across many samples) so the report shows one root
+    cause instead of N near-identical blocks.
+
+    Rule-based hits key on the actual matched log line, not just the pattern
+    name — a broad pattern can match genuinely different underlying failures,
+    which must stay separate rather than being reported as one repeated error.
+    """
+    if d.tier == "rule-based":
+        norm = re.sub(r"\d+", "#", d.matched_text)
+        norm = re.sub(r"/\S+", "<path>", norm)
+        return f"{d.rule_name}::rule-based::{d.matched_pattern}::{norm}"
+    if d.tier == "llm":
+        norm = re.sub(r"\d+", "#", d.root_cause)
+        return f"{d.rule_name}::llm::{d.error_type}::{norm[:200]}"
+    return f"{d.rule_name}::undiagnosed::{d.error_type}"
+
+
+def _group_diagnoses(results: list[RuleDiagnosis]) -> list[list[RuleDiagnosis]]:
+    groups: dict[str, list[RuleDiagnosis]] = {}
+    order: list[str] = []
+    for r in results:
+        sig = _diagnosis_signature(r)
+        if sig not in groups:
+            groups[sig] = []
+            order.append(sig)
+        groups[sig].append(r)
+    return [groups[sig] for sig in order]
+
+
+def render_group(group: list[RuleDiagnosis], idx: int, total: int) -> None:
+    rep = group[0]
+    n = len(group)
+    header = f"  Group {idx}/{total}: {rep.rule_name}"
+    if n > 1:
+        header += f"  {_c(f'× {n} samples', BOLD, CYAN)}"
+    elif rep.wildcards:
+        header += f"  {_c('['+rep.wildcards+']', DIM)}"
+    tier_label = _c(f"[{rep.tier}]", GREEN if rep.tier == "rule-based" else CYAN)
+    conf = rep.confidence
     conf_str   = f"{conf * 100:.0f}%"
     conf_color = GREEN if conf >= 0.7 else YELLOW if conf >= 0.4 else RED
 
     print()
     print(_c("─" * 64, BOLD))
     print(f"{_c(header, BOLD, RED)}  {tier_label}  {_c(conf_str, conf_color)}")
-    if d.slurm_log_path:
-        print(f"  {_c('Log:', DIM)} {_c(d.slurm_log_path, DIM)}")
+    if rep.slurm_log_path:
+        print(f"  {_c('Log (representative):', DIM)} {_c(rep.slurm_log_path, DIM)}")
+    if n > 1:
+        samples = [r.wildcards for r in group if r.wildcards]
+        shown = ", ".join(samples[:8])
+        more = f"  … +{n - 8} more" if n > 8 else ""
+        print(f"  {_c('Affected:', DIM)} {shown}{more}")
     print(_c("─" * 64, BOLD))
 
-    print(f"  {_c('Error type', BOLD)}  {_c(d.error_type, YELLOW)}")
+    print(f"  {_c('Error type', BOLD)}  {_c(rep.error_type, YELLOW)}")
+    if rep.matched_text:
+        print(f"  {_c('Evidence', BOLD)}    {_c(rep.matched_text, DIM)}")
 
-    if d.root_cause:
+    if rep.root_cause:
         print(f"\n  {_c('Root Cause', BOLD)}")
-        print(textwrap.fill(d.root_cause, width=74,
+        print(textwrap.fill(rep.root_cause, width=74,
                             initial_indent="    ", subsequent_indent="    "))
 
-    if d.evidence:
+    if rep.evidence:
         print(f"\n  {_c('Evidence', BOLD)}")
-        for ev in d.evidence:
+        for ev in rep.evidence:
             src = ev.get("source", ""); det = ev.get("detail", "")
             print(f"    {_c('▸', CYAN)} {_c(src, DIM)}  {det}")
 
-    if d.fix_suggestions:
+    if rep.fix_suggestions:
         print(f"\n  {_c('Fix Suggestions', BOLD)}")
-        for i, f in enumerate(d.fix_suggestions, 1):
+        for i, f in enumerate(rep.fix_suggestions, 1):
             line = textwrap.fill(f, width=70, subsequent_indent="       ")
             print(f"    {_c(str(i)+'.', GREEN, BOLD)} {line}")
 
-    if d.follow_up_checks:
+    if rep.follow_up_checks:
         print(f"\n  {_c('Follow-up', BOLD)}")
-        for c in d.follow_up_checks:
+        for c in rep.follow_up_checks:
             print(f"    {_c('○', DIM)} {c}")
 
-    if d.matched_pattern:
-        print(f"\n  {_c('Pattern:', DIM)} {_c(d.matched_pattern, DIM)}")
+    if rep.matched_pattern:
+        print(f"\n  {_c('Pattern:', DIM)} {_c(rep.matched_pattern, DIM)}")
 
 
 def render_summary(results: list[RuleDiagnosis]) -> None:
     n_rule = sum(1 for r in results if r.tier == "rule-based")
     n_llm  = sum(1 for r in results if r.tier == "llm")
     n_unk  = sum(1 for r in results if r.tier == "undiagnosed")
+    groups = _group_diagnoses(results)
     print()
     print(_c("━" * 64, BOLD))
     print(_c("  🔬  Snakemake AI Debugger", BOLD, CYAN))
     print(_c("━" * 64, BOLD))
-    print(f"  {len(results)} failed rule(s)  ·  "
+    print(f"  {len(results)} failed rule(s) in {len(groups)} distinct error(s)  ·  "
           f"{_c(str(n_rule)+' rule-based', GREEN)}  ·  "
           f"{_c(str(n_llm)+' LLM', CYAN)}  ·  "
           f"{_c(str(n_unk)+' undiagnosed', YELLOW if n_unk else DIM)}")
-    for i, d in enumerate(results, 1):
-        render_single(d, i, len(results))
+    for i, group in enumerate(groups, 1):
+        render_group(group, i, len(groups))
     print()
     print(_c("━" * 64, DIM))
     print()
@@ -422,8 +473,11 @@ def diagnose(
     for block in blocks:
         sl = block.slurm_log
         # Feed the slurm log content to Tier-1 first, then the main-log block
+        # Match against the windowed error_context, not the raw tail: retry/
+        # shutdown boilerplate that Snakemake appends after a job's real
+        # stderr can otherwise push the actual error out of the search text.
         quick = quick_diagnose(
-            rule_log        = sl.content if sl else "",
+            rule_log        = sl.error_context if sl else "",
             snakemake_block = block.block_text,
         )
 
@@ -443,6 +497,7 @@ def diagnose(
                 fix_suggestions = quick.fix_suggestions,
                 confidence      = quick.confidence,
                 matched_pattern = quick.matched_pattern,
+                matched_text    = quick.matched_text,
             ))
         else:
             print(_c(f"  ? [{block.rule_name}] no pattern match → queuing for LLM", YELLOW))

@@ -1,0 +1,10 @@
+llm:
+  backend: claude
+  model: claude-haiku-4-5   # cheapest current Claude model ($1/$5 per 1M tokens)
+
+api_keys:
+  # Get a key at https://console.anthropic.com, paste it below,
+  # OR delete this line and instead `export ANTHROPIC_API_KEY=sk-ant-...` in your shell.
+  claude: sk-ant-CHANGEME
+
+# rename the file to .snakemake_ai_debugger.yaml and fill in your API key

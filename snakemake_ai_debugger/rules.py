@@ -16,7 +16,7 @@ Design principle:
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 
@@ -28,6 +28,9 @@ class QuickDiagnosis:
     fix_suggestions:  list[str]
     matched_pattern:  str          # which pattern fired (for debugging)
     confidence:       float = 1.0  # rule-based matches are high-confidence
+    matched_text:     str = ""     # the actual log line that fired the regex —
+                                    # lets two hits on the same pattern but with
+                                    # genuinely different content stay distinguishable
 
 
 @dataclass
@@ -37,7 +40,10 @@ class RulePattern:
     # One of these must match (checked against rule log then snakemake block)
     patterns:    list[str]     # regex patterns (re.IGNORECASE)
     root_cause:  str           # human-readable explanation
-    fixes:       list[str]     # ordered: most likely fix first
+    # Optional — Tier-1 is for fast, free error *identification*; actionable
+    # fixes are better generated on demand by --llm than hand-maintained
+    # per pattern, so new patterns don't need to write these.
+    fixes:       list[str] = field(default_factory=list)
     confidence:  float = 1.0
 
 
@@ -389,6 +395,51 @@ PATTERNS: list[RulePattern] = [
         ],
     ),
 
+    # More specific SQANTI3 failure modes are checked first — the generic
+    # catch-all below fires only when none of these match, so genuinely
+    # different SQANTI3 crashes don't collapse into the same canned advice.
+    RulePattern(
+        name="sqanti3_cli_arg_error",
+        error_type="ToolCrash:SQANTI3ArgError",
+        patterns=[
+            r"sqanti3_filter\.py:\s*error:\s*unrecognized arguments",
+        ],
+        root_cause=(
+            "sqanti3_filter.py was called with a flag its subcommand does not "
+            "accept (e.g. --gtf/--isoforms passed to 'rules' mode, which only "
+            "the 'ml' mode takes). This is a wrong shell command in the "
+            "Snakemake rule itself, not a data or environment problem."
+        ),
+        fixes=[
+            "Compare the flags in the rule's shell command against "
+            "`sqanti3_filter.py rules --help` / `sqanti3_filter.py ml --help` "
+            "— the two subcommands take different arguments.",
+            "Remove or move the flags that belong to the other subcommand.",
+        ],
+        confidence=0.97,
+    ),
+
+    RulePattern(
+        name="sqanti3_report_error",
+        error_type="ToolCrash:SQANTI3ReportGeneration",
+        patterns=[
+            r"Something went wrong during (Rules|Machine [Ll]earning) filtering report",
+        ],
+        root_cause=(
+            "The SQANTI3 filter step ran but crashed while generating its own "
+            "summary report. The actual exception is in SQANTI3's own "
+            "filter_report.log (path printed on the line above this error in "
+            "the Slurm log), not in this job's stderr."
+        ),
+        fixes=[
+            "Open the filter_report.log path printed right above this error — "
+            "that has the real traceback.",
+            "This report step is usually R/rmarkdown-based — confirm R and "
+            "its packages are present inside the container.",
+        ],
+        confidence=0.9,
+    ),
+
     RulePattern(
         name="sqanti3_error",
         error_type="ToolCrash:SQANTI3",
@@ -506,15 +557,26 @@ def quick_diagnose(rule_log: str, snakemake_block: str) -> Optional[QuickDiagnos
     for pat in PATTERNS:
         for text in search_texts:
             for regex in pat.patterns:
-                if re.search(regex, text, re.IGNORECASE):
+                m = re.search(regex, text, re.IGNORECASE)
+                if m:
                     return QuickDiagnosis(
                         error_type=pat.error_type,
                         root_cause=pat.root_cause,
                         fix_suggestions=pat.fixes,
                         matched_pattern=f"{pat.name} · /{regex}/",
                         confidence=pat.confidence,
+                        matched_text=_line_containing(text, m.start()),
                     )
     return None
+
+
+def _line_containing(text: str, pos: int) -> str:
+    """The single log line that contains character offset `pos`."""
+    start = text.rfind("\n", 0, pos) + 1
+    end = text.find("\n", pos)
+    if end == -1:
+        end = len(text)
+    return text[start:end].strip()
 
 
 def list_patterns() -> None:

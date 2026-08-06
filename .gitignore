@@ -4,3 +4,4 @@
 .venv/
 .DS_Store
 .snakemake/
+.snakemake_ai_debugger.yaml

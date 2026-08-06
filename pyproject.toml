@@ -22,6 +22,8 @@ dependencies = [
 
 [project.optional-dependencies]
 llm = ["anthropic>=0.25.0"]
+openai = ["openai>=1.0.0"]
+gemini = ["google-genai>=1.0.0"]
 dev = ["pytest", "pytest-cov"]
 
 [project.scripts]
