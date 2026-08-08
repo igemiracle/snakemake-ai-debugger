@@ -392,9 +392,9 @@ def _error_signature(err: CollectedError) -> str:
     cause instead of N near-identical blocks.
 
     Rule-based hits are keyed on the *actual matched log line*, not just the
-    pattern name — a broad pattern (e.g. a generic "SQANTI3 error") can match
-    genuinely different underlying failures, and those must stay separate
-    rather than being reported as one repeated error.
+    pattern name — a broad pattern (e.g. a generic "command not found") can
+    match genuinely different underlying failures, and those must stay
+    separate rather than being reported as one repeated error.
     """
     if err.diagnosis:
         norm = _normalize_signature_text(err.diagnosis.matched_text, err.wildcards)

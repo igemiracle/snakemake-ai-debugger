@@ -11,6 +11,12 @@ Design principle:
     fewest tokens), then falls back to the Snakemake summary block.
   • `fix` is specific and actionable, not generic advice.
   • Keep this file easy to extend: just add a new RulePattern to PATTERNS.
+
+PATTERNS here only covers tool-agnostic Snakemake/HPC/environment errors.
+Pipeline- or lab-specific tool patterns belong in a separate pip-installable
+rule pack registered via the "snakemake_ai_debugger.rule_packs" entry point
+(see register_patterns() / _load_rule_packs() below) — that keeps internal
+pipeline details out of this public package.
 """
 
 from __future__ import annotations
@@ -132,15 +138,14 @@ PATTERNS: list[RulePattern] = [
         ],
         root_cause=(
             "The job was killed by the OS or Slurm because it exceeded the "
-            "memory (or time) limit. For ONT data this is common with Dorado "
-            "basecalling and IsoQuant on large samples."
+            "memory (or time) limit."
         ),
         fixes=[
             "Increase `resources: mem_mb=` in the rule (check sacct MaxRSS for actual peak).",
             "If using Slurm: check `sacct -j <jobid> --format=MaxRSS,Elapsed` for actual usage.",
             "Split the input into smaller chunks and run in parallel.",
-            "For IsoQuant: use `--low-memory` flag if available for your version.",
-            "For Dorado: reduce `--batch-size` or run on a node with more RAM.",
+            "Check if the tool has a low-memory or streaming mode for large inputs.",
+            "Reduce any batch-size / chunk-size parameter the tool exposes.",
         ],
         confidence=0.95,
     ),
@@ -252,41 +257,6 @@ PATTERNS: list[RulePattern] = [
     ),
 
     RulePattern(
-        name="isoquant_no_reads",
-        error_type="ToolCrash:IsoQuantNoReads",
-        patterns=[
-            r"isoquant.*no (reads|alignments)",
-            r"isoquant.*empty (bam|input)",
-            r"ERROR.*isoquant.*0 reads",
-        ],
-        root_cause="IsoQuant received a BAM with zero usable reads. The upstream alignment or filtering step produced an empty file.",
-        fixes=[
-            "Check the BAM: `samtools flagstat <file.bam>` — confirm reads are present.",
-            "Verify the reference genome and annotation match (same chromosome naming: chr1 vs 1).",
-            "Check minimap2 mapping rate — very low (<5%) usually means wrong reference.",
-        ],
-    ),
-
-    RulePattern(
-        name="dorado_gpu_error",
-        error_type="ToolCrash:DoradoGPU",
-        patterns=[
-            r"dorado.*CUDA",
-            r"dorado.*GPU.*error",
-            r"CUDA error",
-            r"no CUDA-capable device",
-            r"device-side assert triggered",
-        ],
-        root_cause="Dorado failed to access or use the GPU. Either no GPU is allocated, the CUDA driver is incompatible, or GPU memory is exhausted.",
-        fixes=[
-            "Confirm GPU allocation: `nvidia-smi` inside the job environment.",
-            "Request a GPU node in Slurm: add `#SBATCH --gres=gpu:1` or `resources: gpu=1`.",
-            "Reduce `--batch-size` to lower GPU memory usage.",
-            "Check CUDA version compatibility: `nvcc --version` vs Dorado's requirements.",
-        ],
-    ),
-
-    RulePattern(
         name="python_import_error",
         error_type="PythonImportError",
         patterns=[
@@ -317,223 +287,43 @@ PATTERNS: list[RulePattern] = [
         ],
     ),
 
-    # ── ONT RNA-seq pipeline tools ──────────────────────────────
-
-    RulePattern(
-        name="minimap2_index_error",
-        error_type="ToolCrash:Minimap2",
-        patterns=[
-            r"minimap2.*\[ERROR\]",
-            r"minimap2.*failed to open",
-            r"minimap2.*can't open file",
-            r"\[map_worker\].*failed",
-            r"minimap2.*segmentation fault",
-        ],
-        root_cause="minimap2 failed to open the reference index or input file. The reference .mmi index may be missing, corrupted, or built with an incompatible minimap2 version.",
-        fixes=[
-            "Rebuild the index: delete the .mmi file and re-run the indexing rule.",
-            "Check the reference FASTA exists and is not truncated: `samtools faidx <ref.fa>`.",
-            "Confirm minimap2 version matches the index (re-index after version upgrade).",
-        ],
-    ),
-
-    RulePattern(
-        name="salmon_index_error",
-        error_type="ToolCrash:SalmonIndex",
-        patterns=[
-            r"salmon.*Error",
-            r"salmon.*could not open",
-            r"salmon.*index.*not found",
-            r"salmon.*invalid index",
-            r"salmon.*failed to parse",
-            r"Error computing effective length",
-            r"salmon.*no valid alignments",
-        ],
-        root_cause="Salmon failed — typically a missing or incompatible index, an empty transcriptome FASTA, or no valid reads mapped.",
-        fixes=[
-            "Rebuild the Salmon index: delete it and re-run the index rule.",
-            "Verify the transcriptome FASTA is non-empty: `grep -c '>' <transcripts.fa>`.",
-            "Check read count in the input: `samtools flagstat <input.bam>` — very low mapping rate needs investigation.",
-            "Confirm the decoys file matches the genome used for the index.",
-        ],
-    ),
-
-    RulePattern(
-        name="stringtie_no_reads",
-        error_type="ToolCrash:StringTieNoReads",
-        patterns=[
-            r"StringTie.*Warning.*no valid reads",
-            r"StringTie.*no valid bundles",
-            r"stringtie.*error.*no valid",
-            r"Error.*StringTie.*empty",
-        ],
-        root_cause="StringTie received a BAM with zero usable reads in the target region. Either the BAM is empty, filtered too aggressively, or reference chromosomes don't match.",
-        fixes=[
-            "Check BAM read count: `samtools flagstat <sample.bam>`.",
-            "Verify chromosome naming matches between BAM and GTF (chr1 vs 1).",
-            "Confirm the BAM is sorted and indexed: `samtools sort` then `samtools index`.",
-        ],
-    ),
-
-    RulePattern(
-        name="gffcompare_error",
-        error_type="ToolCrash:GFFcompare",
-        patterns=[
-            r"gffcompare.*Error",
-            r"gffcompare.*cannot open",
-            r"Error.*parsing.*GTF",
-            r"gffcompare.*failed",
-            r"gffread.*error",
-            r"gffread.*cannot open",
-        ],
-        root_cause="gffcompare or gffread failed to parse the GTF/GFF file. The file may be malformed, empty, or use incompatible annotation formats.",
-        fixes=[
-            "Validate the GTF: `grep -v '^#' <file.gtf> | awk '$3==\"transcript\"' | wc -l` — confirm > 0.",
-            "Check if upstream StringTie/IsoQuant produced an empty GTF.",
-            "Ensure the GTF uses the same chromosome naming as the genome FASTA.",
-            "Run gffread manually to get the full error message.",
-        ],
-    ),
-
-    # More specific SQANTI3 failure modes are checked first — the generic
-    # catch-all below fires only when none of these match, so genuinely
-    # different SQANTI3 crashes don't collapse into the same canned advice.
-    RulePattern(
-        name="sqanti3_cli_arg_error",
-        error_type="ToolCrash:SQANTI3ArgError",
-        patterns=[
-            r"sqanti3_filter\.py:\s*error:\s*unrecognized arguments",
-        ],
-        root_cause=(
-            "sqanti3_filter.py was called with a flag its subcommand does not "
-            "accept (e.g. --gtf/--isoforms passed to 'rules' mode, which only "
-            "the 'ml' mode takes). This is a wrong shell command in the "
-            "Snakemake rule itself, not a data or environment problem."
-        ),
-        fixes=[
-            "Compare the flags in the rule's shell command against "
-            "`sqanti3_filter.py rules --help` / `sqanti3_filter.py ml --help` "
-            "— the two subcommands take different arguments.",
-            "Remove or move the flags that belong to the other subcommand.",
-        ],
-        confidence=0.97,
-    ),
-
-    RulePattern(
-        name="sqanti3_report_error",
-        error_type="ToolCrash:SQANTI3ReportGeneration",
-        patterns=[
-            r"Something went wrong during (Rules|Machine [Ll]earning) filtering report",
-        ],
-        root_cause=(
-            "The SQANTI3 filter step ran but crashed while generating its own "
-            "summary report. The actual exception is in SQANTI3's own "
-            "filter_report.log (path printed on the line above this error in "
-            "the Slurm log), not in this job's stderr."
-        ),
-        fixes=[
-            "Open the filter_report.log path printed right above this error — "
-            "that has the real traceback.",
-            "This report step is usually R/rmarkdown-based — confirm R and "
-            "its packages are present inside the container.",
-        ],
-        confidence=0.9,
-    ),
-
-    RulePattern(
-        name="sqanti3_error",
-        error_type="ToolCrash:SQANTI3",
-        patterns=[
-            r"SQANTI3.*[Ee]rror",
-            r"sqanti.*[Ee]rror",
-            r"sqanti.*Traceback",
-            r"sqanti.*failed",
-            r"Error.*sqanti.*GTF",
-            r"sqanti.*no transcripts",
-        ],
-        root_cause="SQANTI3 QC failed — typically due to an empty or malformed input GTF, mismatched genome annotation, or missing reference files.",
-        fixes=[
-            "Check the input GTF from StringTie/IsoQuant: `awk '$3==\"transcript\"' <input.gtf> | wc -l`.",
-            "Verify the genome annotation GTF and the sample GTF use the same chromosome format.",
-            "Confirm that all SQANTI3 reference files (cage peaks, polyA sites) are present.",
-            "Run SQANTI3 manually on a small subset to reproduce and see the full traceback.",
-        ],
-    ),
-
-    RulePattern(
-        name="jaffa_fusion_error",
-        error_type="ToolCrash:JAFFAfusion",
-        patterns=[
-            r"JAFFA.*[Ee]rror",
-            r"jaffa.*failed",
-            r"bpipe.*error",
-            r"jaffal.*Traceback",
-            r"java.*OutOfMemoryError",
-            r"JAFFA.*no results",
-        ],
-        root_cause="JAFFA gene-fusion detection failed. Common causes: Java heap exhaustion, missing JAFFA reference database, or too few input reads.",
-        fixes=[
-            "Increase Java heap in the JAFFA bpipe config: add `-Xmx<N>g` to the Java call.",
-            "Verify the JAFFA reference directory is bound/accessible in the container (`--bind /path/to/jaffa_ref`).",
-            "Check fastq read count: JAFFA needs a minimum number of reads to produce results.",
-        ],
-    ),
-
-    RulePattern(
-        name="ctat_fusion_error",
-        error_type="ToolCrash:CTATfusion",
-        patterns=[
-            r"ctat.*(LR.)?fusion.*[Ee]rror",
-            r"STAR-Fusion.*[Ee]rror",
-            r"ctat.*failed",
-            r"STAR.*genome.*not found",
-            r"STAR.*genome.*load.*error",
-        ],
-        root_cause="CTAT-LR-Fusion / STAR-Fusion failed. Usually the CTAT genome library path is wrong, the STAR genome is missing, or there is insufficient memory for genome loading.",
-        fixes=[
-            "Verify the CTAT library path matches the `--genome_lib_dir` / bind path in the singularity call.",
-            "Re-download or untar the CTAT genome library if it was interrupted.",
-            "Increase `mem_mb` — STAR genome loading requires ~30 GB RAM for human genome.",
-        ],
-    ),
-
-    RulePattern(
-        name="dorado_modification_error",
-        error_type="ToolCrash:DoradoModification",
-        patterns=[
-            r"dorado.*mod.*[Ee]rror",
-            r"dorado.*basecall.*[Ee]rror",
-            r"dorado.*model.*not found",
-            r"dorado.*could not load model",
-            r"dorado.*pod5.*error",
-            r"pod5.*[Ee]rror",
-        ],
-        root_cause="Dorado modification basecalling failed. The modification model may be missing, the POD5 file is corrupt, or GPU allocation is insufficient.",
-        fixes=[
-            "Download the modification model: `dorado download --model <model_name>`.",
-            "Verify the POD5 file is not truncated: `pod5 view <file.pod5> | head`.",
-            "Confirm GPU allocation: `nvidia-smi` — Dorado modification calling requires a GPU.",
-            "Check container bind paths include the POD5 data directory.",
-        ],
-    ),
-
-    RulePattern(
-        name="nanoplot_error",
-        error_type="ToolCrash:NanoPlot",
-        patterns=[
-            r"NanoPlot.*[Ee]rror",
-            r"nanoplot.*[Ee]rror",
-            r"NanoPlot.*failed",
-            r"NanoStat.*[Ee]rror",
-        ],
-        root_cause="NanoPlot QC failed — typically an empty input FASTQ/BAM or an incompatible input format.",
-        fixes=[
-            "Check that the input FASTQ/BAM exists and is non-empty.",
-            "Verify the input is a valid ONT FASTQ (contains @-headers with length/quality fields).",
-        ],
-        confidence=0.85,
-    ),
 ]
+
+
+# ─────────────────────────────────────────────────────────────────
+# Rule packs — extend PATTERNS without forking this file
+# ─────────────────────────────────────────────────────────────────
+# Anyone with tools not covered above (a lab's internal pipeline, a
+# specific instrument, etc.) can ship their own patterns as a separate
+# pip-installable package. Register them by exposing a
+# "snakemake_ai_debugger.rule_packs" entry point that resolves to a
+# zero-arg callable returning list[RulePattern] — no changes to this
+# repo required. Custom patterns are checked before the built-ins so
+# they can be more specific than a generic catch-all here.
+
+def register_patterns(patterns: list[RulePattern]) -> None:
+    """Prepend custom RulePatterns so they're checked before the built-ins."""
+    PATTERNS[:0] = patterns
+
+
+def _load_rule_packs() -> None:
+    try:
+        from importlib.metadata import entry_points
+    except ImportError:
+        return
+    try:
+        eps = entry_points(group="snakemake_ai_debugger.rule_packs")
+    except TypeError:  # Python <3.10 API shape
+        eps = entry_points().get("snakemake_ai_debugger.rule_packs", [])
+    for ep in eps:
+        try:
+            register_patterns(ep.load()())
+        except Exception as e:
+            import warnings
+            warnings.warn(f"snakemake-ai-debugger: failed to load rule pack '{ep.name}': {e}")
+
+
+_load_rule_packs()
 
 
 # ─────────────────────────────────────────────────────────────────

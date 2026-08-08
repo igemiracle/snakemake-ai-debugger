@@ -48,18 +48,19 @@ You'll get a coloured terminal report **and** a timestamped YAML file:
   Confidence    82%
 
   Root Cause
-    The container's awk (mawk 1.3.3) silently discards lines
-    with embedded NUL bytes present in this ONT FASTQ, producing
-    an empty BED file with no error code.
+    The rule exited 0 but never wrote temp.bed. Slurm shows no
+    crash, so the tool silently produced empty output — most
+    likely a wildcard/path mismatch or a malformed input record
+    the tool skipped without erroring.
 
   Evidence
     ▸ .snakemake/log/2025-05-26.log:134   Output file temp.bed was not created
     ▸ Slurm job 894312                     ExitCode 0 — process did not crash
 
   Fix Suggestions
-    1. Pin gawk>=5.1 in the container (mawk has known NUL-byte issues).
-    2. Add a post-command guard: [ -s {output} ] || (echo "empty output" && exit 1)
-    3. Validate input FASTQ with seqkit stats before the rule runs.
+    1. Add a post-command guard: [ -s {output} ] || (echo "empty output" && exit 1)
+    2. Verify the output path matches exactly what the command writes.
+    3. Run the shell command manually with the expanded paths to reproduce.
 
   Follow-up Checks
     ○ grep -c '' logs/extract_ids.err  — confirm zero-byte output
@@ -130,8 +131,8 @@ evidence:
   - source: ".snakemake/log/...log:134"
     detail: "Output file temp.bed was not created"
 fix_suggestions:
-  - "Pin gawk>=5.1 in the container"
-  - "Add post-command guard ..."
+  - "Add post-command guard: [ -s {output} ] || (echo 'empty output' && exit 1)"
+  - "Verify the output path matches exactly what the command writes"
 confidence: 0.82
 follow_up_checks:
   - "grep -c '' logs/extract_ids.err"
@@ -139,6 +140,46 @@ follow_up_checks:
 
 The YAML is machine-readable — pipe it into your ticket system, Slack bot,
 or Snakemake report generator.
+
+---
+
+## Extending Tier-1 with your own rules
+
+`rules.py` only ships tool-agnostic Snakemake/HPC/environment patterns
+(missing output, OOM, conda errors, ...). If you want fast, free,
+no-LLM-call detection for errors from tools specific to your own
+pipeline, ship them as a separate pip-installable package instead of
+forking this repo:
+
+```python
+# your_package/rules.py
+from snakemake_ai_debugger.rules import RulePattern
+
+MY_PATTERNS = [
+    RulePattern(
+        name="my_tool_error",
+        error_type="ToolCrash:MyTool",
+        patterns=[r"my_tool.*fatal error"],
+        root_cause="...",
+        fixes=["..."],
+    ),
+]
+
+def get_patterns() -> list[RulePattern]:
+    return MY_PATTERNS
+```
+
+```toml
+# your_package/pyproject.toml
+[project.entry-points."snakemake_ai_debugger.rule_packs"]
+my_pack = "your_package.rules:get_patterns"
+```
+
+`pip install your_package` alongside `snakemake-ai-debugger` and the
+patterns are picked up automatically — no Snakefile or core-package
+changes needed. Custom patterns are checked before the built-ins, so
+they can be more specific than a generic catch-all here. Run
+`snakemake-ai-debugger --list-patterns` to confirm they loaded.
 
 ---
 

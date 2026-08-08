@@ -146,8 +146,8 @@ def _find_latest_snakemake_log(log_dir: Path) -> Optional[Path]:
 
 SYSTEM_PROMPT = textwrap.dedent("""
     You are an expert bioinformatics engineer specialising in Snakemake,
-    HPC/Slurm, Singularity containers, and long-read sequencing tools
-    (ONT Dorado, IsoQuant, minimap2, samtools, gffcompare).
+    HPC/Slurm, Singularity/Apptainer containers, and common
+    bioinformatics command-line tools.
 
     A rule-based classifier already screened this error and could NOT identify it.
     Analyse the context and return ONLY a valid YAML document — no markdown
