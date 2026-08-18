@@ -63,13 +63,10 @@ class SlurmLogResult:
         return _extract_error_context(self.content)
 
     def display_path(self) -> str:
-        """Short path for terminal output."""
+        """Absolute path for terminal output (click-to-open in most terminals)."""
         if not self.log_path:
             return "(not found)"
-        try:
-            return str(self.log_path.relative_to(Path.cwd()))
-        except ValueError:
-            return str(self.log_path)
+        return str(self.log_path.resolve())
 
 
 # ─────────────────────────────────────────────────────────────────
